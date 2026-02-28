@@ -1,15 +1,23 @@
 """FastAPI application for ChatBotura REST API."""
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Observability imports
+from app.observability import (
+    init_telemetry, set_tracer, get_tracer, metrics_endpoint,
+    REQUEST_COUNT, REQUEST_LATENCY
+)
+from app.logging_config import setup_logging, get_logger, LogContext, log_error
 
 from app.db import init_db, get_tenant, get_or_create_conversation, add_message, get_conversation_history
 from app.rag import init_rag
@@ -21,16 +29,28 @@ APP_NAME = "ChatBotura"
 APP_VERSION = "1.0.0"
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
+# Setup logging
+logger = setup_logging("chatbotura")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize services on startup."""
-    print("Initializing ChatBotura services...")
+    logger.info("Initializing ChatBotura services...")
+    
+    # Initialize telemetry
+    tracer = init_telemetry("chatbotura-api")
+    set_tracer(tracer)
+    logger.info("OpenTelemetry tracing initialized")
+    
+    # Initialize services
     init_db()
     init_rag()
     init_engine()
+    
+    logger.info("ChatBotura services initialized successfully")
     yield
-    print("Shutting down ChatBotura...")
+    logger.info("Shutting down ChatBotura...")
 
 
 # Create FastAPI app
@@ -75,6 +95,65 @@ class HealthResponse(BaseModel):
     database: str
 
 
+# Middleware for metrics and logging
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    """Middleware for request tracing and metrics."""
+    start_time = time.time()
+    
+    # Extract tenant_id from path or query if available
+    tenant_id = request.path_params.get("tenant_id")
+    if not tenant_id and request.query_params.get("tenant_id"):
+        tenant_id = request.query_params.get("tenant_id")
+    
+    # Get tracer
+    tracer = get_tracer()
+    
+    with tracer.start_as_current_span(f"{request.method} {request.url.path}") as span:
+        span.set_attribute("http.method", request.method)
+        span.set_attribute("http.url", str(request.url))
+        span.set_attribute("http.target", request.url.path)
+        if tenant_id:
+            span.set_attribute("tenant_id", tenant_id)
+        
+        try:
+            response = await call_next(request)
+            status = str(response.status_code)
+        except Exception as e:
+            status = "500"
+            raise
+        finally:
+            duration = time.time() - start_time
+            
+            # Update Prometheus metrics
+            endpoint = request.url.path
+            REQUEST_COUNT.labels(
+                method=request.method,
+                endpoint=endpoint,
+                status=status,
+                tenant_id=tenant_id or "unknown"
+            ).inc()
+            
+            REQUEST_LATENCY.labels(
+                method=request.method,
+                endpoint=endpoint,
+                tenant_id=tenant_id or "unknown"
+            ).observe(duration)
+            
+            # Set span attributes
+            span.set_attribute("http.status_code", int(status))
+            span.set_attribute("latency_ms", duration * 1000)
+    
+    return response
+
+
+# Metrics endpoint
+@app.get("/metrics", tags=["Observability"])
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return metrics_endpoint()
+
+
 @app.get("/", tags=["Root"])
 async def root():
     """Root endpoint."""
@@ -111,52 +190,70 @@ async def chat(
     Returns:
         ChatResponse with the generated response
     """
-    # Validate tenant exists
-    tenant = get_tenant(request.tenant_id)
-    if not tenant:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Tenant '{request.tenant_id}' not found"
-        )
-
-    # Get conversation history from DB if session_id provided
-    chat_history = request.chat_history or []
-    if request.session_id:
-        # Try to load from DB
-        try:
-            db_history = get_conversation_history(request.tenant_id, request.session_id)
-            if db_history:
-                chat_history = db_history
-        except Exception:
-            pass  # Fall back to provided chat_history
-
-    # Generate response
-    try:
-        response = generate_response(
-            tenant_id=request.tenant_id,
-            user_message=request.message,
-            chat_history=chat_history
-        )
-        
-        # Save messages to DB if session_id provided
+    start_time = time.time()
+    tracer = get_tracer()
+    
+    with tracer.start_as_current_span("chat_request") as span:
+        span.set_attribute("tenant_id", request.tenant_id)
         if request.session_id:
-            try:
-                conversation_id = get_or_create_conversation(request.tenant_id, request.session_id)
-                add_message(conversation_id, "user", request.message)
-                add_message(conversation_id, "assistant", response)
-            except Exception as e:
-                print(f"Warning: Failed to save message to DB: {e}")
+            span.set_attribute("session_id", request.session_id)
+        span.set_attribute("message_length", len(request.message))
         
-        return ChatResponse(
-            response=response,
-            tenant_id=request.tenant_id,
-            llm_provider=LLM_PROVIDER
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error generating response: {str(e)}"
-        )
+        # Validate tenant exists
+        tenant = get_tenant(request.tenant_id)
+        if not tenant:
+            span.set_attribute("error", "tenant_not_found")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Tenant '{request.tenant_id}' not found"
+            )
+
+        # Get conversation history from DB if session_id provided
+        chat_history = request.chat_history or []
+        if request.session_id:
+            # Try to load from DB
+            try:
+                db_history = get_conversation_history(request.tenant_id, request.session_id)
+                if db_history:
+                    chat_history = db_history
+            except Exception as e:
+                logger.warning(f"Failed to load conversation history: {e}")
+
+        # Generate response
+        try:
+            response = generate_response(
+                tenant_id=request.tenant_id,
+                user_message=request.message,
+                chat_history=chat_history,
+                session_id=request.session_id
+            )
+            
+            # Calculate latency
+            latency_ms = (time.time() - start_time) * 1000
+            span.set_attribute("latency_ms", latency_ms)
+            span.set_attribute("response_length", len(response))
+            
+            # Structured logging
+            with LogContext(
+                tenant_id=request.tenant_id,
+                session_id=request.session_id,
+                latency_ms=round(latency_ms, 2)
+            ):
+                logger.info(f"Chat request completed in {latency_ms:.2f}ms")
+            
+            return ChatResponse(
+                response=response,
+                tenant_id=request.tenant_id,
+                llm_provider=LLM_PROVIDER
+            )
+        except Exception as e:
+            span.set_attribute("error", str(e))
+            span.record_exception(e)
+            log_error(logger, e, tenant_id=request.tenant_id, session_id=request.session_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Error generating response: {str(e)}"
+            )
 
 
 @app.get("/api/v1/conversations/{tenant_id}/{session_id}/history", tags=["Conversations"])
@@ -182,6 +279,7 @@ async def get_history(tenant_id: str, session_id: str):
         history = get_conversation_history(tenant_id, session_id)
         return {"session_id": session_id, "tenant_id": tenant_id, "messages": history}
     except Exception as e:
+        log_error(logger, e, tenant_id=tenant_id, session_id=session_id)
         raise HTTPException(
             status_code=500,
             detail=f"Error getting history: {str(e)}"
@@ -214,6 +312,7 @@ async def delete_conversation_endpoint(tenant_id: str, session_id: str):
         delete_conversation(conversation_id)
         return {"message": "Conversation deleted"}
     except Exception as e:
+        log_error(logger, e, tenant_id=tenant_id, session_id=session_id)
         raise HTTPException(
             status_code=500,
             detail=f"Error deleting conversation: {str(e)}"

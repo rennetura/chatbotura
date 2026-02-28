@@ -1,5 +1,6 @@
 """AI Engine for ChatBotura - Configurable LLM Provider (OpenAI or OpenRouter)."""
 import os
+import time
 from typing import Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 
 from app.db import get_tenant
 from app.rag import search_similar
+from app.observability import get_tracer, trace_llm_call, trace_rag_search, trace_db_query
 
 # LLM Configuration
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
@@ -90,34 +92,55 @@ def generate_response(
         Generated response string
     """
     from app.db import get_or_create_conversation, add_message, get_conversation_history
+    from app.logging_config import get_logger
+    
+    logger = get_logger(__name__)
+    tracer = get_tracer()
     
     if chat_history is None:
         chat_history = []
 
-    # 0. Load history from DB if session_id provided
-    if session_id:
-        try:
-            db_history = get_conversation_history(tenant_id, session_id)
-            if db_history:
-                chat_history = db_history
-        except Exception as e:
-            print(f"Warning: Failed to load conversation history: {e}")
+    # Create span for this generation request
+    with tracer.start_as_current_span("generate_response") as span:
+        span.set_attribute("tenant_id", tenant_id)
+        span.set_attribute("message_length", len(user_message))
+        if session_id:
+            span.set_attribute("session_id", session_id)
 
-    # 1. Fetch tenant config
-    tenant = get_tenant(tenant_id)
-    if not tenant:
-        return f"Error: Tenant '{tenant_id}' not found."
+        # 0. Load history from DB if session_id provided
+        if session_id:
+            try:
+                with trace_db_query(tenant_id, "select"):
+                    db_history = get_conversation_history(tenant_id, session_id)
+                    if db_history:
+                        chat_history = db_history
+            except Exception as e:
+                logger.warning(f"Failed to load conversation history: {e}")
 
-    system_prompt = tenant["system_prompt"]
-    tone = tenant["tone"]
-    business_name = tenant["business_name"]
+        # 1. Fetch tenant config
+        with tracer.start_as_current_span("fetch_tenant_config") as fetch_span:
+            tenant = get_tenant(tenant_id)
+            fetch_span.set_attribute("tenant_id", tenant_id)
+            if not tenant:
+                return f"Error: Tenant '{tenant_id}' not found."
 
-    # 2. Perform RAG similarity search
-    relevant_docs = search_similar(tenant_id, user_message, n_results=3)
-    context = "\n\n".join(relevant_docs) if relevant_docs else "No relevant context found."
+            system_prompt = tenant["system_prompt"]
+            tone = tenant["tone"]
+            business_name = tenant["business_name"]
 
-    # 3. Build prompt with persona, context, and history
-    context_block = f"""You are representing: {business_name}
+        # 2. Perform RAG similarity search with tracing
+        with tracer.start_as_current_span("rag_search") as rag_span:
+            rag_span.set_attribute("tenant_id", tenant_id)
+            rag_span.set_attribute("n_results", 3)
+            
+            with trace_rag_search(tenant_id):
+                relevant_docs = search_similar(tenant_id, user_message, n_results=3)
+            
+            context = "\n\n".join(relevant_docs) if relevant_docs else "No relevant context found."
+            rag_span.set_attribute("docs_found", len(relevant_docs))
+
+        # 3. Build prompt with persona, context, and history
+        context_block = f"""You are representing: {business_name}
 Tone: {tone}
 
 Relevant Information:
@@ -126,33 +149,46 @@ Relevant Information:
 Previous Conversation:
 """
 
-    # Add chat history to context
-    for msg in chat_history[-5:]:  # Last 5 messages for context
-        role_label = "Customer" if msg["role"] == "user" else "You"
-        context_block += f"{role_label}: {msg['content']}\n"
+        # Add chat history to context
+        for msg in chat_history[-5:]:  # Last 5 messages for context
+            role_label = "Customer" if msg["role"] == "user" else "You"
+            context_block += f"{role_label}: {msg['content']}\n"
 
-    context_block += f"\nCustomer: {user_message}\n\nYou:"
+        context_block += f"\nCustomer: {user_message}\n\nYou:"
 
-    # 4. Call LLM
-    try:
-        llm = get_llm()
-        response = llm.invoke([
-            HumanMessage(content=f"{system_prompt}\n\n{context_block}")
-        ])
-        response_text = response.content
-        
-        # Save messages to DB if session_id provided
-        if session_id:
+        # 4. Call LLM with tracing
+        with tracer.start_as_current_span("llm_invoke") as llm_span:
+            llm_span.set_attribute("tenant_id", tenant_id)
+            llm_span.set_attribute("provider", LLM_PROVIDER)
+            
             try:
-                conversation_id = get_or_create_conversation(tenant_id, session_id)
-                add_message(conversation_id, "user", user_message)
-                add_message(conversation_id, "assistant", response_text)
+                llm = get_llm()
+                
+                with trace_llm_call(tenant_id, LLM_PROVIDER):
+                    response = llm.invoke([
+                        HumanMessage(content=f"{system_prompt}\n\n{context_block}")
+                    ])
+                
+                response_text = response.content
+                llm_span.set_attribute("response_length", len(response_text))
+                
+                # Save messages to DB if session_id provided
+                if session_id:
+                    try:
+                        with trace_db_query(tenant_id, "insert"):
+                            conversation_id = get_or_create_conversation(tenant_id, session_id)
+                            add_message(conversation_id, "user", user_message)
+                            add_message(conversation_id, "assistant", response_text)
+                    except Exception as e:
+                        logger.warning(f"Failed to save message to history: {e}")
+                
+                span.set_attribute("success", True)
+                return response_text
+                
             except Exception as e:
-                print(f"Warning: Failed to save message to history: {e}")
-        
-        return response_text
-    except Exception as e:
-        return f"Error generating response: {str(e)}"
+                llm_span.record_exception(e)
+                span.set_attribute("error", str(e))
+                return f"Error generating response: {str(e)}"
 
 
 def init_engine() -> None:
