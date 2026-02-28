@@ -2,11 +2,12 @@
 import streamlit as st
 import os
 import sys
+import uuid
 
 # Add parent to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.db import init_db, get_all_tenants
+from app.db import init_db, get_all_tenants, get_conversation_history, delete_conversation, get_or_create_conversation
 from app.rag import init_rag
 from app.engine import generate_response, init_engine
 
@@ -23,6 +24,10 @@ if "messages" not in st.session_state:
 
 if "tenant_id" not in st.session_state:
     st.session_state.tenant_id = None
+
+if "session_id" not in st.session_state:
+    # Generate a new session ID for persistent conversations
+    st.session_state.session_id = str(uuid.uuid4())
 
 
 def init_services():
@@ -68,16 +73,28 @@ def main():
     # Reset chat when tenant changes
     if current_tenant_id != st.session_state.tenant_id:
         st.session_state.tenant_id = current_tenant_id
-        st.session_state.messages = []
+        # Generate new session ID for new tenant
+        st.session_state.session_id = str(uuid.uuid4())
+        # Load history from DB for this tenant/session
+        try:
+            st.session_state.messages = get_conversation_history(current_tenant_id, st.session_state.session_id)
+        except Exception:
+            st.session_state.messages = []
         st.rerun()
 
     # Show tenant info
     tenant = next(t for t in tenants if t["tenant_id"] == current_tenant_id)
     st.sidebar.markdown("---")
     st.sidebar.markdown(f"**Tone:** {tenant['tone']}")
+    st.sidebar.markdown(f"**Session:** {st.session_state.session_id[:8]}...")
 
-    # Clear chat button
+    # Clear chat button (clears both UI and DB)
     if st.sidebar.button("Clear Chat"):
+        try:
+            conversation_id = get_or_create_conversation(current_tenant_id, st.session_state.session_id)
+            delete_conversation(conversation_id)
+        except Exception:
+            pass
         st.session_state.messages = []
         st.rerun()
 
@@ -98,20 +115,17 @@ def main():
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 try:
-                    # Convert messages to history format
-                    history = [
-                        {"role": m["role"], "content": m["content"]}
-                        for m in st.session_state.messages[:-1]
-                    ]
-
+                    # Use session_id for persistent conversation history
+                    # The engine will load history from DB and save new messages
                     response = generate_response(
                         tenant_id=current_tenant_id,
                         user_message=prompt,
-                        chat_history=history
+                        chat_history=[],  # Engine loads from DB via session_id
+                        session_id=st.session_state.session_id
                     )
                     st.markdown(response)
 
-                    # Add to history
+                    # Add to UI history for display
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": response

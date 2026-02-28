@@ -1,31 +1,56 @@
-"""AI Engine for ChatBotura - LangChain + OpenAI integration."""
+"""AI Engine for ChatBotura - Configurable LLM Provider (OpenAI or OpenRouter)."""
 import os
 from typing import Optional
 from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.schema import HumanMessage, AIMessage
-from langchain.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel
 
 from app.db import get_tenant
 from app.rag import search_similar
 
-# Initialize LLM (uses OPENAI_API_KEY from environment)
+# LLM Configuration
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+# Model configurations
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o")
+
+# Initialize LLM (lazy loaded)
 _llm = None
 
 
 def get_llm():
-    """Get or create OpenAI LLM instance."""
+    """Get or create LLM instance based on configured provider."""
     global _llm
     if _llm is None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY environment variable not set")
-        _llm = ChatOpenAI(
-            model="gpt-4o",
-            temperature=0.7,
-            api_key=api_key
-        )
+        if LLM_PROVIDER == "openrouter":
+            if not OPENROUTER_API_KEY:
+                raise ValueError("OPENROUTER_API_KEY environment variable not set")
+            _llm = ChatOpenAI(
+                model=OPENROUTER_MODEL,
+                temperature=0.7,
+                api_key=OPENROUTER_API_KEY,
+                base_url="https://openrouter.ai/api/v1",
+                extra_headers={
+                    "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "https://chatbotura.local"),
+                    "X-Title": os.getenv("OPENROUTER_TITLE", "ChatBotura"),
+                }
+            )
+            print(f"✓ Using OpenRouter with model: {OPENROUTER_MODEL}")
+        else:
+            # Default to OpenAI
+            if not OPENAI_API_KEY:
+                raise ValueError("OPENAI_API_KEY environment variable not set")
+            _llm = ChatOpenAI(
+                model=OPENAI_MODEL,
+                temperature=0.7,
+                api_key=OPENAI_API_KEY
+            )
+            print(f"✓ Using OpenAI with model: {OPENAI_MODEL}")
     return _llm
 
 
@@ -49,7 +74,8 @@ def format_chat_history(chat_history: list[dict]) -> list:
 def generate_response(
     tenant_id: str,
     user_message: str,
-    chat_history: Optional[list[dict]] = None
+    chat_history: Optional[list[dict]] = None,
+    session_id: Optional[str] = None
 ) -> str:
     """
     Generate a response using tenant config, RAG context, and chat history.
@@ -58,12 +84,24 @@ def generate_response(
         tenant_id: The tenant identifier
         user_message: The user's input message
         chat_history: List of previous messages [{"role": "user"|"assistant", "content": "..."}]
+        session_id: Optional session ID for persistent conversation storage
 
     Returns:
         Generated response string
     """
+    from app.db import get_or_create_conversation, add_message, get_conversation_history
+    
     if chat_history is None:
         chat_history = []
+
+    # 0. Load history from DB if session_id provided
+    if session_id:
+        try:
+            db_history = get_conversation_history(tenant_id, session_id)
+            if db_history:
+                chat_history = db_history
+        except Exception as e:
+            print(f"Warning: Failed to load conversation history: {e}")
 
     # 1. Fetch tenant config
     tenant = get_tenant(tenant_id)
@@ -101,7 +139,18 @@ Previous Conversation:
         response = llm.invoke([
             HumanMessage(content=f"{system_prompt}\n\n{context_block}")
         ])
-        return response.content
+        response_text = response.content
+        
+        # Save messages to DB if session_id provided
+        if session_id:
+            try:
+                conversation_id = get_or_create_conversation(tenant_id, session_id)
+                add_message(conversation_id, "user", user_message)
+                add_message(conversation_id, "assistant", response_text)
+            except Exception as e:
+                print(f"Warning: Failed to save message to history: {e}")
+        
+        return response_text
     except Exception as e:
         return f"Error generating response: {str(e)}"
 
