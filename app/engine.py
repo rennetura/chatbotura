@@ -1,6 +1,7 @@
 """AI Engine for ChatBotura - Configurable LLM Provider (OpenAI or OpenRouter)."""
 import os
 import time
+import uuid
 from typing import Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -8,9 +9,13 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from pydantic import BaseModel
 
-from app.db import get_tenant
+from app.db import get_tenant, get_or_create_conversation, add_message
 from app.rag import search_similar
 from app.observability import get_tracer, trace_llm_call, trace_rag_search, trace_db_query
+from app.graph import build_graph
+
+# Global graph instance
+_graph = None
 
 # LLM Configuration
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").lower()
@@ -80,7 +85,7 @@ def generate_response(
     session_id: Optional[str] = None
 ) -> str:
     """
-    Generate a response using tenant config, RAG context, and chat history.
+    Generate a response using LangGraph state machine.
 
     Args:
         tenant_id: The tenant identifier
@@ -91,7 +96,6 @@ def generate_response(
     Returns:
         Generated response string
     """
-    from app.db import get_or_create_conversation, add_message, get_conversation_history
     from app.logging_config import get_logger
     
     logger = get_logger(__name__)
@@ -107,98 +111,62 @@ def generate_response(
         if session_id:
             span.set_attribute("session_id", session_id)
 
-        # 0. Load history from DB if session_id provided
+        # Build message list: chat_history + new user message
+        messages = chat_history + [{"role": "user", "content": user_message}]
+
+        # Prepare initial state for graph
+        state = {
+            "tenant_id": tenant_id,
+            "messages": messages,
+            "context": [],
+            "response": ""
+        }
+
+        # Use session_id as thread_id for checkpointing, or generate a unique one
+        thread_id = session_id or str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
+
+        try:
+            # Invoke the graph
+            result = _graph.invoke(state, config=config)
+            response_text = result["response"]
+            span.set_attribute("success", True)
+        except Exception as e:
+            span.record_exception(e)
+            span.set_attribute("error", str(e))
+            logger.error(f"Graph invocation failed: {e}")
+            return f"Error generating response: {str(e)}"
+
+        # Save messages to DB if session_id provided
         if session_id:
             try:
-                with trace_db_query(tenant_id, "select"):
-                    db_history = get_conversation_history(tenant_id, session_id)
-                    if db_history:
-                        chat_history = db_history
+                # Save both user and assistant messages
+                conversation_id = get_or_create_conversation(tenant_id, session_id)
+                # Only add if not already present? For simplicity, we add.
+                # To avoid duplicates, we could check, but it's fine.
+                add_message(conversation_id, "user", user_message)
+                add_message(conversation_id, "assistant", response_text)
             except Exception as e:
-                logger.warning(f"Failed to load conversation history: {e}")
+                logger.warning(f"Failed to save message to history: {e}")
 
-        # 1. Fetch tenant config
-        with tracer.start_as_current_span("fetch_tenant_config") as fetch_span:
-            tenant = get_tenant(tenant_id)
-            fetch_span.set_attribute("tenant_id", tenant_id)
-            if not tenant:
-                return f"Error: Tenant '{tenant_id}' not found."
-
-            system_prompt = tenant["system_prompt"]
-            tone = tenant["tone"]
-            business_name = tenant["business_name"]
-
-        # 2. Perform RAG similarity search with tracing
-        with tracer.start_as_current_span("rag_search") as rag_span:
-            rag_span.set_attribute("tenant_id", tenant_id)
-            rag_span.set_attribute("n_results", 3)
-            
-            with trace_rag_search(tenant_id):
-                relevant_docs = search_similar(tenant_id, user_message, n_results=3)
-            
-            context = "\n\n".join(relevant_docs) if relevant_docs else "No relevant context found."
-            rag_span.set_attribute("docs_found", len(relevant_docs))
-
-        # 3. Build prompt with persona, context, and history
-        context_block = f"""You are representing: {business_name}
-Tone: {tone}
-
-Relevant Information:
-{context}
-
-Previous Conversation:
-"""
-
-        # Add chat history to context
-        for msg in chat_history[-5:]:  # Last 5 messages for context
-            role_label = "Customer" if msg["role"] == "user" else "You"
-            context_block += f"{role_label}: {msg['content']}\n"
-
-        context_block += f"\nCustomer: {user_message}\n\nYou:"
-
-        # 4. Call LLM with tracing
-        with tracer.start_as_current_span("llm_invoke") as llm_span:
-            llm_span.set_attribute("tenant_id", tenant_id)
-            llm_span.set_attribute("provider", LLM_PROVIDER)
-            
-            try:
-                llm = get_llm()
-                
-                with trace_llm_call(tenant_id, LLM_PROVIDER):
-                    response = llm.invoke([
-                        HumanMessage(content=f"{system_prompt}\n\n{context_block}")
-                    ])
-                
-                response_text = response.content
-                llm_span.set_attribute("response_length", len(response_text))
-                
-                # Save messages to DB if session_id provided
-                if session_id:
-                    try:
-                        with trace_db_query(tenant_id, "insert"):
-                            conversation_id = get_or_create_conversation(tenant_id, session_id)
-                            add_message(conversation_id, "user", user_message)
-                            add_message(conversation_id, "assistant", response_text)
-                    except Exception as e:
-                        logger.warning(f"Failed to save message to history: {e}")
-                
-                span.set_attribute("success", True)
-                return response_text
-                
-            except Exception as e:
-                llm_span.record_exception(e)
-                span.set_attribute("error", str(e))
-                return f"Error generating response: {str(e)}"
+        return response_text
 
 
 def init_engine() -> None:
     """Initialize the AI engine."""
-    # Validate API key on init
+    # Validate API key and initialize LLM
     try:
         llm = get_llm()
-        print("✓ AI Engine initialized")
     except ValueError as e:
         print(f"⚠ Warning: {e}")
+
+    # Build LangGraph conversation graph
+    global _graph
+    try:
+        _graph = build_graph()
+        print("✓ AI Engine with LangGraph initialized")
+    except Exception as e:
+        print(f"⚠ Failed to initialize LangGraph: {e}")
 
 
 if __name__ == "__main__":
