@@ -42,23 +42,53 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Environment Variables
+### 2. Configuration
 
-Create a `.env` file:
+ChatBotura uses **Pydantic Settings** to manage configuration from environment variables and optional YAML templates.
+
+#### Option A: Use `.env` file (recommended for development)
+
+1. Copy the example environment file:
+
+```bash
+cp .env.example .env
+```
+
+2. Edit `.env` and fill in the required values, especially `OPENAI_API_KEY` or `OPENROUTER_API_KEY`.
+
+#### Option B: Use `config.yaml`
+
+You can also provide a `config.yaml` file with the same settings in a hierarchical format. The application expects environment variables, so if you use YAML, you must either export them or use a tool to convert. For simplicity, use `.env`.
+
+See the **Configuration** section below for a complete list of available settings.
+
+#### Environment Variables (Nested Delimiter)
+
+The settings are structured into nested sections. Environment variables use double underscores (`__`) to denote nesting.
+
+Examples:
+- `DATABASE__PATH=chatbotura.db`
+- `API__PORT=8000`
+- `API__CORS_ORIGINS=["*"]`
+- `LLM__PROVIDER=openai`
+
+### 3. Environment Variables (Common)
+
+At minimum, set:
 
 ```bash
 OPENAI_API_KEY=your-api-key-here
-
-# Optional: OpenRouter configuration
-# LLM_PROVIDER=openrouter
-# OPENROUTER_API_KEY=your-openrouter-key
-
-# Observability (optional)
-# LOG_LEVEL=INFO                    # DEBUG, INFO, WARNING, ERROR
-# OTEL_EXPORTER_OTLP_ENDPOINT=      # OTLP collector (e.g., http://localhost:4317)
-# OTEL_SERVICE_NAME=chatbotura-api
-# DEPLOYMENT_ENV=development
 ```
+
+Optional (with defaults):
+
+- `LLM_PROVIDER=openai` (or `openrouter`)
+- `LOG_LEVEL=INFO`
+- `API__PORT=8000`
+- `RATE_LIMIT__REQUESTS=100`
+- `RATE_LIMIT__WINDOW=60`
+
+Refer to `.env.example` for the full list.
 
 ### 3. Initialize Database & RAG
 
@@ -113,6 +143,55 @@ The app will open at `http://localhost:8501`
 - **Chat History:** Maintains conversation context
 - **Tenant Config:** Each tenant has custom system prompt and tone
 - **Observability:** OpenTelemetry tracing + Prometheus metrics
+
+## Configuration
+
+ChatBotura's behavior is controlled by a central settings object. You can configure it via environment variables (or a `.env` file) using **Pydantic Settings**.
+
+### Settings Structure
+
+| Section | Field | Type | Default | Description |
+|---------|-------|------|---------|-------------|
+| **database** | `path` | string | `chatbotura.db` | SQLite database file path |
+| **chroma** | `path` | string | `chroma_data` | ChromaDB persistent storage directory |
+| **api** | `host` | string | `0.0.0.0` | API server host |
+| | `port` | integer | `8000` | API server port |
+| | `cors_origins` | list of strings | `["*"]` | Allowed CORS origins |
+| **llm** | `provider` | string | `openai` | LLM provider: `openai` or `openrouter` |
+| | `openai_api_key` | string (optional) | `None` | OpenAI API key |
+| | `openrouter_api_key` | string (optional) | `None` | OpenRouter API key |
+| | `openai_model` | string | `gpt-4o` | OpenAI model name |
+| | `openrouter_model` | string | `openai/gpt-4o` | OpenRouter model name |
+| | `openrouter_referer` | string | `https://chatbotura.local` | OpenRouter referer header |
+| | `openrouter_title` | string | `ChatBotura` | OpenRouter site title |
+| **rate_limit** | `requests` | integer | `100` | Max requests per minute per tenant |
+| | `window` | integer | `60` | Rate limit window in seconds |
+| **logging** | `level` | string | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+### Using Environment Variables
+
+Prefix section keys in uppercase and separate nested fields with double underscores:
+
+```bash
+export DATABASE__PATH=mydb.db
+export API__PORT=8080
+export LLM__PROVIDER=openrouter
+export OPENROUTER_API_KEY=sk-...
+```
+
+For list values like `API__CORS_ORIGINS`, use a JSON array string:
+
+```bash
+export API__CORS_ORIGINS='["http://localhost:3000","https://myapp.com"]'
+```
+
+### Configuration Files
+
+- **`.env`**: Place environment variable definitions here (automatically loaded).
+- **`.env.example`**: Template file with all available options.
+- **`config.yaml`**: YAML template showing hierarchical structure (for reference).
+
+> **Note:** The application primary reads from environment variables. The `config.yaml` is provided as a human‑readable reference; it is not automatically loaded. To use it, convert its values into environment variables or a `.env` file.
 
 ## Observability
 

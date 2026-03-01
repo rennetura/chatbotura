@@ -24,6 +24,7 @@ from app.db import init_db, get_tenant, get_or_create_conversation, add_message,
 from app.rag import init_rag
 from app.engine import init_engine, generate_response, LLM_PROVIDER
 from app.auth import AuthMiddleware, RateLimiterMiddleware, verify_tenant_access
+from app.config import settings
 
 
 # Application settings
@@ -66,7 +67,7 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.api.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -383,7 +384,7 @@ if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=settings.api.host,
+        port=settings.api.port,
         reload=True
     )

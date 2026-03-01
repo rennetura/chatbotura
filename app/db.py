@@ -7,7 +7,9 @@ from typing import Optional, Tuple
 from contextlib import contextmanager
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "chatbotura.db")
+from app.config import settings
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "..", settings.database.path)
 
 
 def get_db_path() -> str:

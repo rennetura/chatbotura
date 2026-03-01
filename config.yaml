@@ -1,0 +1,38 @@
+# ChatBotura Configuration Template
+# Copy this file to .env or set environment variables accordingly.
+#
+# Note: This YAML file is provided as a reference. The application loads settings
+# via environment variables (or a .env file) using Pydantic Settings.
+#
+# Environment variable names use uppercase section keys with double-underscore
+# delimiter for nested fields, e.g., DATABASE__PATH, API__PORT.
+#
+# Alternatively, you can create a .env file with these values.
+
+database:
+  path: chatbotura.db
+
+chroma:
+  path: chroma_data
+
+api:
+  host: 0.0.0.0
+  port: 8000
+  cors_origins:
+    - "*"
+
+llm:
+  provider: openai
+  openai_api_key: null
+  openrouter_api_key: null
+  openai_model: gpt-4o
+  openrouter_model: openai/gpt-4o
+  openrouter_referer: https://chatbotura.local
+  openrouter_title: ChatBotura
+
+rate_limit:
+  requests: 100
+  window: 60
+
+logging:
+  level: INFO

@@ -4,8 +4,10 @@ import chromadb
 from chromadb.config import Settings
 from typing import Optional
 
+from app.config import settings
+
 # Persistent storage for ChromaDB
-CHROMA_PATH = os.path.join(os.path.dirname(__file__), "..", "chroma_data")
+CHROMA_PATH = os.path.join(os.path.dirname(__file__), "..", settings.chroma.path)
 
 # In-memory client for simplicity (use PersistentClient for production)
 _client = None
