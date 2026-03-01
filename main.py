@@ -6,7 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -236,6 +236,59 @@ async def health_check():
     )
 
 
+@app.get("/healthz", tags=["Health"])
+async def liveness():
+    """Liveness probe - is the app alive?"""
+    return {"status": "alive"}
+
+
+@app.get("/ready", tags=["Health"])
+async def readiness():
+    """Readiness probe - is the app ready to serve traffic?"""
+    import app.rag as rag_module
+    import app.engine as engine_module
+    
+    checks = {
+        "database": False,
+        "rag": False,
+        "llm": False
+    }
+    
+    # Check database
+    try:
+        from app.db import get_connection
+        with get_connection() as conn:
+            conn.execute("SELECT 1")
+        checks["database"] = True
+    except Exception as e:
+        logger.warning(f"Database readiness check failed: {e}")
+    
+    # Check RAG
+    try:
+        if hasattr(rag_module, '_rag_initialized') and rag_module._rag_initialized:
+            checks["rag"] = True
+        elif hasattr(rag_module, 'get_rag') and rag_module.get_rag() is not None:
+            checks["rag"] = True
+    except Exception as e:
+        logger.warning(f"RAG readiness check failed: {e}")
+    
+    # Check LLM
+    try:
+        if engine_module.LLM_PROVIDER:
+            checks["llm"] = True
+    except Exception as e:
+        logger.warning(f"LLM readiness check failed: {e}")
+    
+    all_ready = all(checks.values())
+    status_code = 200 if all_ready else 503
+    
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "ready" if all_ready else "not_ready", "checks": checks}
+    )
+
+
 @app.post("/api/v1/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(
     request: ChatRequest,
@@ -410,6 +463,179 @@ async def get_tenant_info(tenant_id: str, req: Request):
     tenant.pop("system_prompt", None)
     tenant.pop("api_key_hash", None)
     return tenant
+
+
+# ============================================================================
+# Admin Authentication Dependency
+# ============================================================================
+
+def verify_admin(request: Request) -> bool:
+    """
+    Verify the request is from an admin.
+    Checks X-Admin-Key header against configured admin API key.
+    Reads from environment variable for flexibility in tests.
+    """
+    admin_key = request.headers.get("x-admin-key")
+    if not admin_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Admin API key required. Include x-admin-key header."
+        )
+    
+    # Read from environment directly for test flexibility
+    expected_key = os.environ.get("ADMIN__API_KEY")
+    if not expected_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Admin API key not configured on server"
+        )
+    
+    if admin_key != expected_key:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid admin API key"
+        )
+    
+    return True
+
+
+# ============================================================================
+# Admin API - Full Tenant CRUD
+# ============================================================================
+
+@app.post("/api/v1/admin/tenants", tags=["Admin - Tenants"])
+async def create_tenant_admin(
+    request: TenantCreateRequest,
+    req: Request,
+    _: bool = Depends(verify_admin)
+):
+    """Create a new tenant (admin only)."""
+    from app.db import create_tenant as db_create_tenant
+    
+    result = db_create_tenant(
+        tenant_id=request.tenant_id,
+        business_name=request.business_name,
+        system_prompt=request.system_prompt,
+        tone=request.tone
+    )
+    
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tenant '{request.tenant_id}' already exists"
+        )
+    
+    return TenantCreateResponse(
+        tenant_id=result["tenant_id"],
+        business_name=result["business_name"],
+        tone=result["tone"],
+        api_key=result["api_key"],
+        message="Tenant created successfully. Save the API key - it won't be shown again."
+    )
+
+
+@app.get("/api/v1/admin/tenants", tags=["Admin - Tenants"])
+async def list_tenants_admin(
+    req: Request,
+    _: bool = Depends(verify_admin)
+):
+    """List all tenants (admin only)."""
+    from app.db import get_all_tenants
+    
+    tenants = get_all_tenants()
+    # Remove sensitive data
+    for tenant in tenants:
+        tenant.pop("api_key_hash", None)
+        tenant.pop("system_prompt", None)
+    
+    return {"tenants": tenants}
+
+
+@app.get("/api/v1/admin/tenants/{tenant_id}", tags=["Admin - Tenants"])
+async def get_tenant_admin(
+    tenant_id: str,
+    req: Request,
+    _: bool = Depends(verify_admin)
+):
+    """Get tenant details (admin only)."""
+    from app.db import get_tenant
+    
+    tenant = get_tenant(tenant_id)
+    if not tenant:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tenant '{tenant_id}' not found"
+        )
+    
+    # Remove sensitive data except for admin
+    tenant.pop("api_key_hash", None)
+    return tenant
+
+
+@app.put("/api/v1/admin/tenants/{tenant_id}", tags=["Admin - Tenants"])
+async def update_tenant_admin(
+    tenant_id: str,
+    request: TenantUpdateRequest,
+    req: Request,
+    _: bool = Depends(verify_admin)
+):
+    """Update tenant configuration (admin only)."""
+    from app.db import update_tenant as db_update_tenant
+    
+    result = db_update_tenant(
+        tenant_id=tenant_id,
+        business_name=request.business_name,
+        system_prompt=request.system_prompt,
+        tone=request.tone
+    )
+    
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tenant '{tenant_id}' not found"
+        )
+    
+    result.pop("api_key_hash", None)
+    result.pop("system_prompt", None)
+    return result
+
+
+@app.delete("/api/v1/admin/tenants/{tenant_id}", tags=["Admin - Tenants"])
+async def delete_tenant_admin(
+    tenant_id: str,
+    req: Request,
+    _: bool = Depends(verify_admin)
+):
+    """Delete a tenant and all its data (admin only)."""
+    from app.db import delete_tenant as db_delete_tenant
+    
+    success = db_delete_tenant(tenant_id)
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tenant '{tenant_id}' not found"
+        )
+    
+    return {"message": f"Tenant '{tenant_id}' deleted successfully"}
+
+
+@app.post("/api/v1/admin/tenants/{tenant_id}/regenerate-key", tags=["Admin - Tenants"])
+async def regenerate_tenant_key(
+    tenant_id: str,
+    req: Request,
+    _: bool = Depends(verify_admin)
+):
+    """Regenerate tenant API key (admin only)."""
+    from app.db import regenerate_tenant_api_key
+    
+    new_key = regenerate_tenant_api_key(tenant_id)
+    if new_key is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tenant '{tenant_id}' not found"
+        )
+    
+    return {"tenant_id": tenant_id, "api_key": new_key, "message": "API key regenerated. Save this key - it won't be shown again."}
 
 
 if __name__ == "__main__":

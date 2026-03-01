@@ -34,6 +34,10 @@ class RateLimitConfig(BaseModel):
     window: int = Field(default=60, description="Rate limit window in seconds")
 
 
+class AdminConfig(BaseModel):
+    api_key: Optional[str] = Field(default=None, description="Admin API key for tenant management")
+
+
 class LoggingConfig(BaseModel):
     level: str = Field(default="INFO", description="Logging level")
 
@@ -45,6 +49,7 @@ class Settings(BaseSettings):
     api: APIConfig = Field(default_factory=APIConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     rate_limit: RateLimitConfig = Field(default_factory=RateLimitConfig)
+    admin: AdminConfig = Field(default_factory=AdminConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     model_config = SettingsConfigDict(

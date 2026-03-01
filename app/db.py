@@ -502,6 +502,6 @@ def regenerate_tenant_api_key(tenant_id: str) -> Optional[str]:
     return None
 
 
-if __name__ == "__main__"
+if __name__ == "__main__":
     init_db()
     print(f"Database initialized at: {get_db_path()}")

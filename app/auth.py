@@ -78,7 +78,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     # Paths that don't require authentication
     EXCLUDED_PATHS = {
+        "/",
         "/health",
+        "/healthz",
+        "/ready",
         "/metrics",
         "/docs",
         "/redoc",
@@ -160,6 +163,8 @@ class RateLimiterMiddleware(BaseHTTPMiddleware):
     # Paths that are excluded from rate limiting
     EXCLUDED_PATHS = {
         "/health",
+        "/healthz",
+        "/ready",
         "/metrics",
         "/docs",
         "/redoc",
