@@ -328,6 +328,90 @@ response = generate_response(
 print(response)
 ```
 
+## API Reference
+
+### Health Endpoints
+
+| Endpoint | Description | Auth Required |
+|----------|-------------|---------------|
+| `GET /` | Root info | No |
+| `GET /health` | Health check | No |
+| `GET /healthz` | Liveness probe | No |
+| `GET /ready` | Readiness probe (DB + RAG) | No |
+| `GET /metrics` | Prometheus metrics | No |
+
+### Chat API
+
+| Endpoint | Method | Description | Auth Required |
+|----------|--------|-------------|---------------|
+| `/api/v1/chat` | POST | Generate chat response | Yes (X-API-Key) |
+| `/api/v1/conversations/{tenant_id}/{session_id}/history` | GET | Get conversation history | Yes |
+| `/api/v1/conversations/{tenant_id}/{session_id}` | DELETE | Delete conversation | Yes |
+
+### Tenant API (Tenant-scoped)
+
+| Endpoint | Method | Description | Auth Required |
+|----------|--------|-------------|---------------|
+| `/api/v1/tenants` | GET | Get authenticated tenant info | Yes |
+| `/api/v1/tenants/{tenant_id}` | GET | Get specific tenant info | Yes |
+
+### Admin API (Full tenant management)
+
+All admin endpoints require `X-Admin-Key` header with the configured admin API key.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/admin/tenants` | POST | Create new tenant |
+| `/api/v1/admin/tenants` | GET | List all tenants |
+| `/api/v1/admin/tenants/{tenant_id}` | GET | Get tenant details |
+| `/api/v1/admin/tenants/{tenant_id}` | PUT | Update tenant config |
+| `/api/v1/admin/tenants/{tenant_id}` | DELETE | Delete tenant |
+| `/api/v1/admin/tenants/{tenant_id}/regenerate-key` | POST | Regenerate API key |
+
+#### Create Tenant Request
+
+```json
+{
+  "tenant_id": "my_business",
+  "business_name": "My Business Name",
+  "system_prompt": "You are a helpful assistant for My Business...",
+  "tone": "professional"
+}
+```
+
+Valid `tone` values: `friendly`, `professional`, `casual`, `formal`
+
+### Docker Deployment
+
+```bash
+# Build and run
+docker-compose up --build
+
+# Access
+# - API: http://localhost:8000
+# - UI: http://localhost:8501
+# - Docs: http://localhost:8000/docs
+```
+
+Set admin API key via environment:
+```bash
+export ADMIN_API_KEY=your-secure-admin-key
+docker-compose up
+```
+
+### Running Tests
+
+```bash
+# Run all tests
+make test
+
+# Run with coverage
+make test-coverage
+
+# Run integration tests
+make test-integration
+```
+
 ## License
 
 MIT
