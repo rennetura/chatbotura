@@ -1,7 +1,7 @@
 """Configuration management for ChatBotura using Pydantic Settings."""
 import os
 from typing import List, Optional
-from pydantic import Field
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 

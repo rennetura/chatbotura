@@ -124,6 +124,38 @@ class HealthResponse(BaseModel):
     database: str
 
 
+# Admin API Models
+class TenantCreateRequest(BaseModel):
+    """Request model for creating a tenant."""
+    tenant_id: str = Field(..., min_length=3, max_length=50, pattern=r'^[a-z0-9_]+$')
+    business_name: str = Field(..., min_length=1, max_length=200)
+    system_prompt: str = Field(..., min_length=10, max_length=5000)
+    tone: str = Field(default="professional", pattern=r'^(friendly|professional|casual|formal)$')
+
+
+class TenantUpdateRequest(BaseModel):
+    """Request model for updating a tenant."""
+    business_name: Optional[str] = Field(None, min_length=1, max_length=200)
+    system_prompt: Optional[str] = Field(None, min_length=10, max_length=5000)
+    tone: Optional[str] = Field(None, pattern=r'^(friendly|professional|casual|formal)$')
+
+
+class TenantResponse(BaseModel):
+    """Response model for tenant (without sensitive data)."""
+    tenant_id: str
+    business_name: str
+    tone: str
+
+
+class TenantCreateResponse(BaseModel):
+    """Response model for tenant creation (includes API key)."""
+    tenant_id: str
+    business_name: str
+    tone: str
+    api_key: str
+    message: str
+
+
 # Middleware for metrics and logging
 @app.middleware("http")
 async def observability_middleware(request: Request, call_next):

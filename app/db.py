@@ -356,6 +356,152 @@ def delete_conversation(conversation_id: str) -> bool:
         return cursor.rowcount > 0
 
 
-if __name__ == "__main__":
+# ============================================================================
+# Admin API - Tenant Management
+# ============================================================================
+
+def create_tenant(
+    tenant_id: str,
+    business_name: str,
+    system_prompt: str,
+    tone: str = "professional"
+) -> Optional[dict]:
+    """Create a new tenant.
+    
+    Args:
+        tenant_id: Unique tenant identifier
+        business_name: Display name for the business
+        system_prompt: System prompt for the AI
+        tone: Conversation tone (friendly, professional, etc.)
+    
+    Returns:
+        Created tenant dict or None if already exists
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        # Check if tenant already exists
+        cursor.execute("SELECT tenant_id FROM tenants WHERE tenant_id = ?", (tenant_id,))
+        if cursor.fetchone():
+            return None
+        
+        cursor.execute(
+            "INSERT INTO tenants (tenant_id, business_name, system_prompt, tone) VALUES (?, ?, ?, ?)",
+            (tenant_id, business_name, system_prompt, tone)
+        )
+        conn.commit()
+        
+        # Generate API key for the new tenant
+        api_key = ensure_tenant_api_key(tenant_id)
+        
+        return {
+            "tenant_id": tenant_id,
+            "business_name": business_name,
+            "system_prompt": system_prompt,
+            "tone": tone,
+            "api_key": api_key  # Only returned on creation
+        }
+
+
+def update_tenant(
+    tenant_id: str,
+    business_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    tone: Optional[str] = None
+) -> Optional[dict]:
+    """Update tenant configuration.
+    
+    Args:
+        tenant_id: Tenant identifier
+        business_name: New business name (optional)
+        system_prompt: New system prompt (optional)
+        tone: New tone (optional)
+    
+    Returns:
+        Updated tenant dict or None if not found
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Check if tenant exists
+        cursor.execute("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        
+        # Build dynamic update
+        updates = []
+        params = []
+        if business_name is not None:
+            updates.append("business_name = ?")
+            params.append(business_name)
+        if system_prompt is not None:
+            updates.append("system_prompt = ?")
+            params.append(system_prompt)
+        if tone is not None:
+            updates.append("tone = ?")
+            params.append(tone)
+        
+        if not updates:
+            return dict(row)
+        
+        params.append(tenant_id)
+        query = f"UPDATE tenants SET {', '.join(updates)} WHERE tenant_id = ?"
+        cursor.execute(query, params)
+        conn.commit()
+        
+        # Return updated tenant
+        cursor.execute("SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,))
+        return dict(cursor.fetchone())
+
+
+def delete_tenant(tenant_id: str) -> bool:
+    """Delete a tenant and all associated data.
+    
+    Args:
+        tenant_id: Tenant identifier
+    
+    Returns:
+        True if deleted, False if not found
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Get all conversations for this tenant
+        cursor.execute("SELECT conversation_id FROM conversations WHERE tenant_id = ?", (tenant_id,))
+        conversations = cursor.fetchall()
+        
+        # Delete all messages for each conversation
+        for conv in conversations:
+            cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conv["conversation_id"],))
+        
+        # Delete all conversations
+        cursor.execute("DELETE FROM conversations WHERE tenant_id = ?", (tenant_id,))
+        
+        # Delete tenant
+        cursor.execute("DELETE FROM tenants WHERE tenant_id = ?", (tenant_id,))
+        conn.commit()
+        
+        return cursor.rowcount > 0
+
+
+def regenerate_tenant_api_key(tenant_id: str) -> Optional[str]:
+    """Regenerate API key for a tenant.
+    
+    Args:
+        tenant_id: Tenant identifier
+    
+    Returns:
+        New API key or None if tenant not found
+    """
+    # Generate new API key
+    new_api_key = generate_api_key()
+    new_hash = hash_api_key(new_api_key)
+    
+    if set_tenant_api_key(tenant_id, new_hash):
+        return new_api_key
+    return None
+
+
+if __name__ == "__main__"
     init_db()
     print(f"Database initialized at: {get_db_path()}")

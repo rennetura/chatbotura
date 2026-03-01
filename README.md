@@ -193,6 +193,40 @@ export API__CORS_ORIGINS='["http://localhost:3000","https://myapp.com"]'
 
 > **Note:** The application primary reads from environment variables. The `config.yaml` is provided as a human‑readable reference; it is not automatically loaded. To use it, convert its values into environment variables or a `.env` file.
 
+## Docker Deployment
+
+For quick setup using Docker and Docker Compose:
+
+```bash
+# Build and run all services
+docker-compose up --build
+
+# Access
+# - API: http://localhost:8000
+# - UI:  http://localhost:8501
+```
+
+A `docker-compose.yml` defines two services:
+
+- `api`: FastAPI server on port 8000
+- `ui`: Streamlit interface on port 8501
+
+Both share a persistent volume `data` to store the SQLite database and ChromaDB files. Environment variables (like `OPENAI_API_KEY`) are injected from your shell or a `.env` file.
+
+> **Note:** The entrypoint automatically initializes the database and RAG on first start.
+
+### Customizing via Docker
+
+You can override settings using environment variables:
+
+```bash
+export OPENAI_API_KEY=your-key
+export LLM_PROVIDER=openai
+docker-compose up
+```
+
+Or define them in a `.env` file in the same directory as `docker-compose.yml`.
+
 ## Observability
 
 ### Structured Logging
