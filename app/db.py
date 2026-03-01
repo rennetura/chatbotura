@@ -2,7 +2,8 @@
 import sqlite3
 import os
 import uuid
-from typing import Optional
+import bcrypt
+from typing import Optional, Tuple
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -30,15 +31,23 @@ def init_db() -> None:
     with get_connection() as conn:
         cursor = conn.cursor()
 
-        # Create tenants table
+        # Create tenants table with API key support
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS tenants (
                 tenant_id TEXT PRIMARY KEY,
                 business_name TEXT NOT NULL,
                 system_prompt TEXT NOT NULL,
-                tone TEXT NOT NULL DEFAULT 'professional'
+                tone TEXT NOT NULL DEFAULT 'professional',
+                api_key_hash TEXT
             )
         """)
+
+        # Add api_key_hash column if it doesn't exist (migration for existing DBs)
+        cursor.execute("PRAGMA table_info(tenants)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if 'api_key_hash' not in columns:
+            cursor.execute("ALTER TABLE tenants ADD COLUMN api_key_hash TEXT")
+            print("✓ Added api_key_hash column to tenants table")
 
         # Create conversations table for persistent chat history
         cursor.execute("""
@@ -82,7 +91,7 @@ def init_db() -> None:
                 (
                     "pizza_shop",
                     "Mario's Pizza Palace",
-                    """You are a friendly and enthusiastic pizza shop assistant. 
+                    """You are a friendly and enthusiastic pizza shop assistant.
 Your goal is to help customers with their orders, answer questions about our menu,
 and provide a warm, inviting experience. Be helpful, quick, and enthusiastic about pizza!
                     """,
@@ -107,6 +116,15 @@ clients that you are not providing legal advice and recommend they consult with 
             conn.commit()
             print("✓ Initialized database with mock tenants")
 
+        # Ensure all tenants have API keys (for new installations or upgrades)
+        cursor.execute("SELECT tenant_id FROM tenants WHERE api_key_hash IS NULL")
+        tenants_without_keys = [row["tenant_id"] for row in cursor.fetchall()]
+        for tenant_id in tenants_without_keys:
+            api_key = ensure_tenant_api_key(tenant_id)
+            if api_key:
+                print(f"✓ Generated API key for tenant '{tenant_id}': {api_key}")
+                print("  ⚠️  Store this key securely! It won't be shown again.")
+
 
 def get_tenant(tenant_id: str) -> Optional[dict]:
     """Fetch tenant configuration by tenant_id."""
@@ -128,6 +146,66 @@ def get_all_tenants() -> list[dict]:
         cursor = conn.cursor()
         cursor.execute("SELECT tenant_id, business_name, system_prompt, tone FROM tenants")
         return [dict(row) for row in cursor.fetchall()]
+
+
+# ============================================================================
+# API Key Management
+# ============================================================================
+
+import secrets
+import hashlib
+
+def generate_api_key(length: int = 32) -> str:
+    """Generate a cryptographically secure API key."""
+    return secrets.token_urlsafe(length)
+
+def hash_api_key(api_key: str) -> str:
+    """Hash an API key using bcrypt."""
+    return bcrypt.hashpw(api_key.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+def verify_api_key(api_key: str, stored_hash: str) -> bool:
+    """Verify an API key against its stored hash."""
+    return bcrypt.checkpw(api_key.encode('utf-8'), stored_hash.encode('utf-8'))
+
+def set_tenant_api_key(tenant_id: str, api_key_hash: str) -> bool:
+    """Set the API key hash for a tenant."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE tenants SET api_key_hash = ? WHERE tenant_id = ?",
+            (api_key_hash, tenant_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
+def get_tenant_by_api_key(api_key: str) -> Optional[dict]:
+    """Fetch tenant by validating API key."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM tenants WHERE api_key_hash IS NOT NULL")
+        rows = cursor.fetchall()
+        for row in rows:
+            tenant_dict = dict(row)
+            if verify_api_key(api_key, tenant_dict["api_key_hash"]):
+                return tenant_dict
+        return None
+
+def ensure_tenant_api_key(tenant_id: str) -> str:
+    """Ensure a tenant has an API key; generate if missing. Returns the plain API key."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT api_key_hash FROM tenants WHERE tenant_id = ?", (tenant_id,))
+        row = cursor.fetchone()
+        if row and row["api_key_hash"]:
+            # API key already exists, return None to indicate it's already set
+            return None
+
+    # Generate new API key
+    api_key = generate_api_key()
+    api_key_hash = hash_api_key(api_key)
+    if set_tenant_api_key(tenant_id, api_key_hash):
+        return api_key
+    return None
 
 
 # Conversation Management Functions

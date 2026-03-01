@@ -1,13 +1,14 @@
 """FastAPI application for ChatBotura REST API."""
 import os
+import re
 import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 # Add parent to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,6 +23,7 @@ from app.logging_config import setup_logging, get_logger, LogContext, log_error
 from app.db import init_db, get_tenant, get_or_create_conversation, add_message, get_conversation_history
 from app.rag import init_rag
 from app.engine import init_engine, generate_response, LLM_PROVIDER
+from app.auth import AuthMiddleware, RateLimiterMiddleware, verify_tenant_access
 
 
 # Application settings
@@ -70,14 +72,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Add rate limiting middleware (will run after auth due to LIFO order)
+app.add_middleware(RateLimiterMiddleware)
+
+# Add authentication middleware (must run before rate limiter to set tenant)
+app.add_middleware(AuthMiddleware)
+
 
 # Request/Response models
 class ChatRequest(BaseModel):
     """Chat request model."""
     tenant_id: str
-    message: str
+    message: str = Field(..., min_length=1, max_length=2000)
     session_id: Optional[str] = None
     chat_history: Optional[list[dict]] = None
+
+    @field_validator('message')
+    @classmethod
+    def validate_message(cls, v: str) -> str:
+        """Validate and sanitize user message."""
+        # Check for suspicious patterns (basic XSS/SQL injection prevention)
+        suspicious_patterns = [
+            r'<script[^>]*>.*?</script>',  # Script tags
+            r'javascript:',
+            r'on\w+\s*=',  # Event handlers like onclick=
+            r'<iframe[^>]*>',  # iframes
+            r'SELECT.*FROM|INSERT.*INTO|UPDATE.*SET|DELETE.*FROM',  # Basic SQL patterns
+            r'DROP\s+TABLE',
+            r'--|/\*|\*/',  # SQL comments
+            r'EXEC(\s+|\(|xpodb_)',
+        ]
+        for pattern in suspicious_patterns:
+            if re.search(pattern, v, re.IGNORECASE):
+                raise ValueError(f"Message contains prohibited content")
+        return v
 
 
 class ChatResponse(BaseModel):
@@ -178,28 +206,34 @@ async def health_check():
 @app.post("/api/v1/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(
     request: ChatRequest,
-    x_api_key: Optional[str] = Header(None)
+    req: Request
 ):
     """
     Generate a chat response.
 
+    Requires X-API-Key header for authentication.
+
     Args:
         request: Chat request with tenant_id, message, optional session_id, and optional chat_history
-        x_api_key: Optional API key for authentication
+        req: FastAPI Request object
 
     Returns:
         ChatResponse with the generated response
     """
     start_time = time.time()
     tracer = get_tracer()
-    
+
     with tracer.start_as_current_span("chat_request") as span:
         span.set_attribute("tenant_id", request.tenant_id)
         if request.session_id:
             span.set_attribute("session_id", request.session_id)
         span.set_attribute("message_length", len(request.message))
-        
-        # Validate tenant exists
+
+        # Verify tenant access (ensures the authenticated tenant matches the requested tenant_id)
+        # This will raise HTTPException if not authorized
+        verify_tenant_access(request.tenant_id, req)
+
+        # Validate tenant exists (additional check)
         tenant = get_tenant(request.tenant_id)
         if not tenant:
             span.set_attribute("error", "tenant_not_found")
@@ -257,24 +291,20 @@ async def chat(
 
 
 @app.get("/api/v1/conversations/{tenant_id}/{session_id}/history", tags=["Conversations"])
-async def get_history(tenant_id: str, session_id: str):
+async def get_history(tenant_id: str, session_id: str, req: Request):
     """Get conversation history for a tenant/session.
-    
+
     Args:
         tenant_id: The tenant identifier
         session_id: The session identifier
-    
+        req: FastAPI Request object
+
     Returns:
         List of messages
     """
-    # Validate tenant exists
-    tenant = get_tenant(tenant_id)
-    if not tenant:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Tenant '{tenant_id}' not found"
-        )
-    
+    # Verify tenant access
+    verify_tenant_access(tenant_id, req)
+
     try:
         history = get_conversation_history(tenant_id, session_id)
         return {"session_id": session_id, "tenant_id": tenant_id, "messages": history}
@@ -287,26 +317,22 @@ async def get_history(tenant_id: str, session_id: str):
 
 
 @app.delete("/api/v1/conversations/{tenant_id}/{session_id}", tags=["Conversations"])
-async def delete_conversation_endpoint(tenant_id: str, session_id: str):
+async def delete_conversation_endpoint(tenant_id: str, session_id: str, req: Request):
     """Delete a conversation.
-    
+
     Args:
         tenant_id: The tenant identifier
         session_id: The session identifier
-    
+        req: FastAPI Request object
+
     Returns:
         Success message
     """
     from app.db import get_or_create_conversation, delete_conversation
-    
-    # Validate tenant exists
-    tenant = get_tenant(tenant_id)
-    if not tenant:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Tenant '{tenant_id}' not found"
-        )
-    
+
+    # Verify tenant access
+    verify_tenant_access(tenant_id, req)
+
     try:
         conversation_id = get_or_create_conversation(tenant_id, session_id)
         delete_conversation(conversation_id)
@@ -320,19 +346,27 @@ async def delete_conversation_endpoint(tenant_id: str, session_id: str):
 
 
 @app.get("/api/v1/tenants", tags=["Tenants"])
-async def list_tenants():
-    """List all available tenants."""
+async def list_tenants(req: Request):
+    """List the authenticated tenant's information."""
     from app.db import get_all_tenants
-    tenants = get_all_tenants()
+    tenant = getattr(req.state, "tenant", None)
+    if not tenant:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Return only the authenticated tenant's info (tenant isolation)
     # Remove sensitive info
-    for tenant in tenants:
-        tenant.pop("system_prompt", None)
-    return {"tenants": tenants}
+    tenant_info = tenant.copy()
+    tenant_info.pop("api_key_hash", None)
+    tenant_info.pop("system_prompt", None)
+    return {"tenants": [tenant_info]}
 
 
 @app.get("/api/v1/tenants/{tenant_id}", tags=["Tenants"])
-async def get_tenant_info(tenant_id: str):
+async def get_tenant_info(tenant_id: str, req: Request):
     """Get tenant information."""
+    # Verify the authenticated tenant has access to the requested tenant_id
+    verify_tenant_access(tenant_id, req)
+
     tenant = get_tenant(tenant_id)
     if not tenant:
         raise HTTPException(
@@ -341,6 +375,7 @@ async def get_tenant_info(tenant_id: str):
         )
     # Remove sensitive system prompt
     tenant.pop("system_prompt", None)
+    tenant.pop("api_key_hash", None)
     return tenant
 
 

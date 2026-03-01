@@ -125,7 +125,7 @@ class StructuredLogger(logging.Logger):
     Custom logger that automatically adds context to all log entries.
     """
     
-    def makeRecord(self, name, level, fn, lno, msg, args, exc_info, extra=None, sinfo=None):
+    def makeRecord(self, name, level, fn, lno, msg, args, exc_info, func=None, extra=None, sinfo=None):
         # Add context to extra
         if extra is None:
             extra = {}
@@ -140,7 +140,7 @@ class StructuredLogger(logging.Logger):
         if "latency_ms" in context and "latency_ms" not in extra:
             extra["latency_ms"] = context["latency_ms"]
         
-        return super().makeRecord(name, level, fn, lno, msg, args, exc_info, extra, sinfo)
+        return super().makeRecord(name, level, fn, lno, msg, args, exc_info, func, extra, sinfo)
 
 
 # ============================================================================
